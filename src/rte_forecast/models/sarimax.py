@@ -49,6 +49,7 @@ class SarimaxDayAhead:
         self.train_window_days, self.maxiter = train_window_days, maxiter
         self.fit_seconds = 0.0
         self.fitted_params: dict[str, float] = {}
+        self.fitted_aic = float("nan")                   # AIC de l'ajustement au début du fold
         self.train_window: tuple[str, str] = ("", "")   # fenêtre d'estimation des coefficients
         self.exog_names: list[str] = []
 
@@ -70,6 +71,7 @@ class SarimaxDayAhead:
             res = model.fit(disp=False, maxiter=self.maxiter)
         self.fit_seconds = time.perf_counter() - t0
         self.fitted_params = {k: float(v) for k, v in res.params.items()}
+        self.fitted_aic = float(res.aic)
         self.train_window = (str(y_tr.index[0]), str(y_tr.index[-1]))
         self.exog_names = list(x_tr.columns)
         preds = []
