@@ -1,0 +1,65 @@
+{
+  "issue_hour": 9,
+  "models_saved": true,
+  "models_dir": "/home/rosco/Bureau/job search radulesco/energy-job-radar/applications/URBAN LINKER/Energy Quant Engineer/load-forecasting-ml/data/models",
+  "split": {
+    "train": [
+      "2020-01-01 00:00:00",
+      "2022-12-31 23:00:00",
+      26304
+    ],
+    "validation": [
+      "2023-01-01 00:00:00",
+      "2023-12-31 23:00:00",
+      8760
+    ],
+    "test": [
+      "2024-01-01 00:00:00",
+      "2024-12-31 23:00:00",
+      8784
+    ]
+  },
+  "folds": [
+    "F01 2022-01 \u2192 2022-03",
+    "F02 2022-04 \u2192 2022-06",
+    "F03 2022-07 \u2192 2022-09",
+    "F04 2022-10 \u2192 2022-12",
+    "F05 2023-01 \u2192 2023-03",
+    "F06 2023-04 \u2192 2023-06",
+    "F07 2023-07 \u2192 2023-09",
+    "F08 2023-10 \u2192 2023-12",
+    "F09 2024-01 \u2192 2024-03",
+    "F10 2024-04 \u2192 2024-06",
+    "F11 2024-07 \u2192 2024-09",
+    "F12 2024-10 \u2192 2024-12"
+  ],
+  "weather_modes": [
+    "normal",
+    "noisy",
+    "perfect"
+  ],
+  "best_params": {
+    "xgboost": {
+      "max_depth": 9,
+      "learning_rate": 0.03,
+      "n_estimators": 500
+    },
+    "random_forest": {
+      "max_depth": null,
+      "min_samples_leaf": 2,
+      "max_features": 0.7
+    }
+  },
+  "models": {
+    "naive_j7": "Naive J-7",
+    "rte_j1": "RTE J-1 (r\u00e9f\u00e9rence externe)",
+    "sarimax": "SARIMAX",
+    "xgboost": "XGBoost",
+    "xgboost_rules": "XGBoost + r\u00e8gles (planning)",
+    "xgboost_rules_adaptive": "XGBoost + r\u00e8gles (adaptatif)",
+    "random_forest": "Random Forest",
+    "random_forest_rules": "RF + r\u00e8gles (planning)",
+    "random_forest_rules_adaptive": "RF + r\u00e8gles (adaptatif)"
+  },
+  "n_predictions": 604992
+}
