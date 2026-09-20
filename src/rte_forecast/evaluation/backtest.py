@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import itertools
 import json
+import platform
 import time
 import warnings
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
@@ -73,6 +75,28 @@ def _train_mask(X: pd.DataFrame, before: pd.Timestamp, normal_only: bool, t0: pd
     return pd.Series(m, index=X.index)
 
 
+def _save_and_describe(model, name: str, stem: Path | None, n_train: int, n_features: int) -> dict:
+    """Sauvegarde un modèle à arbres (XGBoost .ubj ; RF joblib compressé) et décrit ses paramètres."""
+    info: dict = {"params": json.dumps(model.get_params(), default=str), "n_train": n_train,
+                  "n_features": n_features, "file": "", "file_mb": float("nan")}
+    if name == "xgboost":
+        info["extra"] = json.dumps({"n_trees": int(model.get_booster().num_boosted_rounds())})
+    else:
+        nodes = [e.tree_.node_count for e in model.estimators_]
+        info["extra"] = json.dumps({"n_trees": len(nodes), "mean_nodes_per_tree": float(np.mean(nodes)),
+                                    "max_depth_reached": int(max(e.tree_.max_depth
+                                                                 for e in model.estimators_))})
+    if stem is not None:
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        path = stem.with_suffix(".ubj" if name == "xgboost" else ".joblib")
+        if name == "xgboost":
+            model.save_model(path)
+        else:
+            joblib.dump(model, path, compress=3)
+        info["file"], info["file_mb"] = path.name, path.stat().st_size / 1e6
+    return info
+
+
 def _fit(model, X: pd.DataFrame, y: pd.Series):
     t = time.perf_counter()
     model.fit(X, y)
@@ -80,10 +104,14 @@ def _fit(model, X: pd.DataFrame, y: pd.Series):
 
 
 def _fold_task(fold: splits.Fold, Xp: pd.DataFrame, Xc: pd.DataFrame, cols: list[str],
-               p_xgb: dict, p_rf: dict, t0: pd.Timestamp) -> dict:
-    """Entraîne les 4 modèles à arbres d'un fold et prédit la fenêtre de test."""
+               p_xgb: dict, p_rf: dict, t0: pd.Timestamp, save_dir: Path | None = None) -> dict:
+    """Entraîne les 4 modèles à arbres d'un fold et prédit la fenêtre de test.
+
+    Si `save_dir` est fourni, chaque modèle est sauvegardé ICI (dans le processus qui l'a entraîné)
+    et seul un descriptif léger est renvoyé au processus principal.
+    """
     idx = Xp.index[(Xp.index >= fold.test_start) & (Xp.index <= fold.test_end)]
-    out, times, sizes = {}, {}, {}
+    out, times, sizes, infos = {}, {}, {}, {}
     for name, factory, params in (("xgboost", make_xgboost, p_xgb),
                                   ("random_forest", make_random_forest, p_rf)):
         for variant, X, normal_only in (("", Xp, False), ("_normal", Xc, True)):
@@ -93,14 +121,49 @@ def _fold_task(fold: splits.Fold, Xp: pd.DataFrame, Xc: pd.DataFrame, cols: list
             key = name + variant
             out[key] = pd.Series(model.predict(X.loc[idx, cols]), index=idx)
             times[key], sizes[key] = secs, int(m.sum())
-    return {"fold": fold, "pred": pd.DataFrame(out), "fit_seconds": times, "n_train": sizes}
+            if save_dir is not None:
+                infos[key] = _save_and_describe(model, name, save_dir / f"F{fold.fold_id:02d}_{key}",
+                                                sizes[key], len(cols))
+    return {"fold": fold, "pred": pd.DataFrame(out), "fit_seconds": times, "n_train": sizes,
+            "model_info": infos}
 
 
-def _sarimax_task(fold: splits.Fold, load: pd.Series, exog: pd.DataFrame, params: dict) -> dict:
+def _final_task(Xp: pd.DataFrame, Xc: pd.DataFrame, cols: list[str], p_xgb: dict, p_rf: dict,
+                t0: pd.Timestamp, save_dir: Path) -> dict:
+    """Modèles « finaux » : entraînés sur TOUTES les données disponibles (aucune évaluation possible)."""
+    end = Xp.index.max() + pd.Timedelta(hours=1)
+    infos = {}
+    for name, factory, params in (("xgboost", make_xgboost, p_xgb),
+                                  ("random_forest", make_random_forest, p_rf)):
+        for variant, X, normal_only in (("", Xp, False), ("_normal", Xc, True)):
+            m = _train_mask(X, end, normal_only, t0)
+            model, _ = _fit(factory(params), X.loc[m, cols], X.loc[m, "load_mw"])
+            infos[name + variant] = _save_and_describe(model, name, save_dir / f"final_{name}{variant}",
+                                                       int(m.sum()), len(cols))
+    return {"model_info": infos}
+
+
+def _sarimax_task(fold: splits.Fold, load: pd.Series, exog: pd.DataFrame, params: dict,
+                  save_dir: Path | None = None) -> dict:
     m = SarimaxDayAhead(**params)
     pred = m.fit_predict(load, exog, fold.test_start, fold.test_end)
+    info = {}
+    if save_dir is not None:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        # les résultats statsmodels embarquent le filtre de Kalman (~124 Mo par fold) : on ne garde que
+        # la spécification et les coefficients estimés, qui suffisent à reconstruire le modèle
+        spec = {"order": list(params["order"]), "seasonal_order": list(params["seasonal_order"]),
+                "exog_names": m.exog_names, "train_window": list(m.train_window),
+                "issue_hour": params.get("issue_hour"), "params": m.fitted_params}
+        path = save_dir / f"F{fold.fold_id:02d}_sarimax.json"
+        path.write_text(json.dumps(spec, indent=2))
+        info["sarimax"] = {"params": json.dumps({k: v for k, v in params.items()}, default=str),
+                           "n_train": params["train_window_days"] * 24,
+                           "n_features": len(m.fitted_params), "file": path.name,
+                           "file_mb": path.stat().st_size / 1e6,
+                           "extra": json.dumps({"coefficients": m.fitted_params})}
     return {"fold": fold, "pred": pred.to_frame("sarimax"), "fit_seconds": {"sarimax": m.fit_seconds},
-            "n_train": {"sarimax": params["train_window_days"] * 24}}
+            "n_train": {"sarimax": params["train_window_days"] * 24}, "model_info": info}
 
 
 def _tuning_task(name: str, params: dict, Xtr, ytr, Xva, yva, cols) -> dict:
@@ -155,13 +218,50 @@ def _cal_kwargs(cfg: dict) -> dict:
             "summer_weeks_after": r["summer_window_weeks_after"]}
 
 
+def _num(row: pd.Series, col: str) -> float:
+    return float(row[col]) if col in row.index and pd.notna(row[col]) else float("nan")
+
+
+def _rule_parameter_rows(hf: HybridForecaster, hybrid: str, mode: str) -> list[dict]:
+    """Paramètres estimés par les moteurs de règles (année analogue, sensibilité thermique, niveaux)."""
+    rows = []
+    for (kind, year), res in hf._cache.items():
+        if not isinstance(res, pd.DataFrame):
+            continue
+        first = res.iloc[0]
+        rows.append({
+            "model": hybrid, "weather_mode": mode, "kind": kind, "year": int(year),
+            "level_mode": hf.level_mode, "reference_year": str(first.get("reference_year", "")),
+            "similarity_score": _num(first, "similarity_score"), "baseline_mw": _num(first, "baseline_mw"),
+            "baseline_ref_mw": _num(first, "baseline_ref_mw"),
+            "thermosensitivity_heat_mw_per_c": _num(first, "thermosensitivity_heat_mw_per_c"),
+            "summer_start_level_mw": _num(first, "summer_start_level_mw"),
+            "summer_trough_level_mw": _num(first, "summer_trough_level_mw"),
+            "summer_end_level_mw": _num(first, "summer_end_level_mw"),
+            "shape_json": json.dumps({str(k): v for k, v in res.attrs.get("shape", {}).items()}),
+            "coef_json": json.dumps({str(k): v for k, v in res.attrs.get("coefficients", {}).items()}),
+            "reason": str(first.get("reason", ""))})
+    return rows
+
+
+def _library_versions() -> dict:
+    import sklearn
+    import statsmodels
+    import xgboost
+    return {"python": platform.python_version(), "pandas": pd.__version__, "numpy": np.__version__,
+            "xgboost": xgboost.__version__, "scikit-learn": sklearn.__version__,
+            "statsmodels": statsmodels.__version__, "joblib": joblib.__version__}
+
+
 def run_all(cfg: dict | None = None, weather_modes=("normal", "noisy", "perfect"), jobs: int = 4,
-            quick: bool = False, skip_sarimax: bool = False, log=print) -> dict[str, Path]:
+            quick: bool = False, skip_sarimax: bool = False, save_models: bool = False,
+            models_dir: str | Path | None = None, log=print) -> dict[str, Path]:
     """Exécute tout le benchmark et écrit les Parquet/JSON de résultats dans data/results."""
     warnings.filterwarnings("ignore")
     cfg = cfg or load_config()
     out_dir = resolve_path(cfg, "results_dir")
     out_dir.mkdir(parents=True, exist_ok=True)
+    mdl_dir = Path(models_dir) if models_dir else resolve_path(cfg, "models_dir")
     df = load_hourly(cfg)
     load = df["load_mw"]
     t0 = df.index.min()
@@ -191,7 +291,7 @@ def run_all(cfg: dict | None = None, weather_modes=("normal", "noisy", "perfect"
     issue = _issue_hour(cfg)
     p_sarimax["issue_hour"] = issue
 
-    preds, fold_rows, explanations = [], [], []
+    preds, fold_rows, explanations, model_rows, rule_rows = [], [], [], [], []
     ref_idx = pd.DatetimeIndex(np.concatenate([
         df.index[(df.index >= f.test_start) & (df.index <= f.test_end)] for f in folds]))
     base = pd.DataFrame({"y_true": load.reindex(ref_idx), "period_type":
@@ -223,16 +323,24 @@ def run_all(cfg: dict | None = None, weather_modes=("normal", "noisy", "perfect"
                             max_fallback_weeks=cfg["features"]["max_fallback_weeks"],
                             issue_hour=issue)
         cols = feature_columns(mode)
-        tasks = [delayed(_fold_task)(f, Xp, Xc, cols, p_xgb, p_rf, t0) for f in folds]
+        save_dir = mdl_dir / mode if save_models else None
+        tasks = [delayed(_fold_task)(f, Xp, Xc, cols, p_xgb, p_rf, t0, save_dir) for f in folds]
         if not skip_sarimax:
             ex = sarimax_exog(Xp)
-            tasks += [delayed(_sarimax_task)(f, load, ex, p_sarimax) for f in folds]
+            tasks += [delayed(_sarimax_task)(f, load, ex, p_sarimax, save_dir) for f in folds]
         t = time.perf_counter()
         results = Parallel(n_jobs=jobs)(tasks)
         log(f"   {len(tasks)} tâches en {time.perf_counter() - t:.0f}s")
 
+        if save_models:
+            final = _final_task(Xp, Xc, cols, p_xgb, p_rf, t0, save_dir)
+            log(f"   modèles finaux (toutes données) sauvegardés dans {save_dir}")
+            model_rows += [{"model": k, "weather_mode": mode, "fold_id": 0, **v}
+                           for k, v in final["model_info"].items()]
         by_model: dict[str, list[pd.Series]] = {}
         for r in results:
+            model_rows += [{"model": k, "weather_mode": mode, "fold_id": r["fold"].fold_id, **v}
+                           for k, v in r.get("model_info", {}).items()]
             for c in r["pred"].columns:
                 by_model.setdefault(c, []).append(r["pred"][c])
             for name, secs in r["fit_seconds"].items():
@@ -254,6 +362,7 @@ def run_all(cfg: dict | None = None, weather_modes=("normal", "noisy", "perfect"
             log(f"   {hyb}: règles en {time.perf_counter() - t:.0f}s ; "
                 f"{res['method'].value_counts().to_dict()}")
             add(hyb, mode, res["yhat"], method=res["method"])
+            rule_rows += _rule_parameter_rows(hf, hyb, mode)
             ex_rows = res[~res["method"].isin([normal.upper()])].copy()
             ex_rows["model"], ex_rows["weather_mode"] = hyb, mode
             ex_rows["y_true"] = load.reindex(ex_rows.index)
@@ -276,14 +385,32 @@ def run_all(cfg: dict | None = None, weather_modes=("normal", "noisy", "perfect"
     fm.merge(fits, on=key + ["fold_id"], how="left").to_parquet(out_dir / "cv_folds.parquet")
 
     log("== importances / SHAP")
-    _importances(cfg, df, cal_h, best, parts, out_dir, quick)
-    meta = {"issue_hour": issue, "split": split_info, "folds": [f.label for f in folds], "weather_modes": list(weather_modes),
+    _importances(cfg, df, cal_h, best, parts, out_dir, quick, jobs)
+    if model_rows:
+        pd.DataFrame(model_rows).to_parquet(out_dir / "model_params.parquet")
+    if rule_rows:
+        pd.DataFrame(rule_rows).to_parquet(out_dir / "rule_params.parquet")
+    if save_models:
+        manifest = {"issue_hour": issue, "cette_convention": "prévision de D émise à D-1 (issue_hour+1):00",
+                    "features_par_scenario": {m: feature_columns(m) for m in weather_modes},
+                    "hyperparametres": best, "sarimax": p_sarimax,
+                    "train_start": str(t0), "data_end": str(df.index.max()),
+                    "nommage": "F<fold>_<modele>.(ubj|joblib|json) = entraîné avant le fold ; "
+                               "final_<modele> = entraîné sur toutes les données (2020-2024)",
+                    "chargement": {"xgboost": "XGBRegressor().load_model(path)",
+                                   "random_forest": "joblib.load(path)",
+                                   "sarimax": "json (ordre + coefficients) ; reconstruction : "
+                                  "SARIMAX(charge, exog, order, seasonal_order).filter(params)"},
+                    "versions": _library_versions()}
+        mdl_dir.mkdir(parents=True, exist_ok=True)
+        (mdl_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+    meta = {"issue_hour": issue, "models_saved": bool(save_models), "models_dir": str(mdl_dir), "split": split_info, "folds": [f.label for f in folds], "weather_modes": list(weather_modes),
             "best_params": best, "models": MODEL_LABELS, "n_predictions": len(predictions)}
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2, default=str))
     return {"results_dir": out_dir}
 
 
-def _importances(cfg, df, cal_h, best, parts, out_dir: Path, quick: bool) -> None:
+def _importances(cfg, df, cal_h, best, parts, out_dir: Path, quick: bool, jobs: int = 4) -> None:
     import shap
 
     Xp = build_features(df, cal_h, weather_mode="normal", issue_hour=_issue_hour(cfg))
@@ -291,9 +418,9 @@ def _importances(cfg, df, cal_h, best, parts, out_dir: Path, quick: bool) -> Non
     t0 = df.index.min()
     tr_end = pd.Timestamp(cfg["split"]["val_end"]) + pd.Timedelta(hours=23)
     m = _train_mask(Xp, tr_end + pd.Timedelta(hours=1), False, t0)
-    xgb, _ = _fit(make_xgboost({**_cfg_params(cfg, "xgboost", best), "n_jobs": 4}), Xp.loc[m, cols],
+    xgb, _ = _fit(make_xgboost({**_cfg_params(cfg, "xgboost", best), "n_jobs": jobs}), Xp.loc[m, cols],
                   Xp.loc[m, "load_mw"])
-    rf, _ = _fit(make_random_forest({**_cfg_params(cfg, "random_forest", best), "n_jobs": 4}),
+    rf, _ = _fit(make_random_forest({**_cfg_params(cfg, "random_forest", best), "n_jobs": jobs}),
                  Xp.loc[m, cols], Xp.loc[m, "load_mw"])
     imp = pd.concat([
         pd.DataFrame({"model": "xgboost", "feature": cols, "importance": xgb.feature_importances_}),

@@ -27,7 +27,8 @@ st.set_page_config(page_title="RTE load forecasting", page_icon="⚡", layout="w
 
 CFG = load_config()
 RES = Path(os.environ["RTE_RESULTS_DIR"]).resolve() if os.environ.get("RTE_RESULTS_DIR") \
-    else resolve_path(CFG, "results_dir")   # ex. RTE_RESULTS_DIR=data/results_issue10h
+    else resolve_path(CFG, "results_dir")   # surcharge possible : RTE_RESULTS_DIR=<dossier>
+ISSUE_HOUR = CFG["features"].get("issue_hour")
 PROC = resolve_path(CFG, "processed_dir")
 
 # --------------------------------------------------------------------------- palette (validée)
@@ -84,6 +85,9 @@ def load_results():
         "predictions", "metrics_split", "metrics_period", "cv_folds", "hyperparameters",
         "feature_importance", "shap_xgboost", "rule_explanations"]}
     r["meta"] = json.loads((RES / "run_meta.json").read_text())
+    for n in ["model_params", "rule_params"]:                     # optionnels (--save-models)
+        p = RES / f"{n}.parquet"
+        r[n] = pd.read_parquet(p) if p.exists() else pd.DataFrame()
     for n in ["analysis_summer_trough", "analysis_summer_shape", "analysis_year_end",
               "analysis_holidays", "analysis_imputation"]:
         p = RES / f"{n}.parquet"
@@ -98,7 +102,7 @@ def load_dataset():
     ck = {"summer_weeks_before": CFG["rules"]["summer_window_weeks_before"],
           "summer_weeks_after": CFG["rules"]["summer_window_weeks_after"]}
     cal = build_hourly_calendar(df.index, **ck)
-    X = build_features(df, cal)
+    X = build_features(df, cal, issue_hour=ISSUE_HOUR)
     return df, cal, X, quality
 
 
@@ -114,6 +118,9 @@ SPLIT_LABEL = {"train_cv": "2022 (CV, entraînement partiel)", "validation": "20
 
 # --------------------------------------------------------------------------- barre latérale
 st.sidebar.title("⚡ Prévision de charge RTE")
+_ih = R["meta"].get("issue_hour")
+st.sidebar.caption("Prévision de D émise à " + ("D 00:00 (charge de la veille complète)" if _ih is None
+                                                 else f"D-1 {int(_ih) + 1:02d}:00 (charge connue jusqu'à D-1 {int(_ih):02d}:00)"))
 mode = st.sidebar.radio(
     "Scénario météo", MODES, index=0,
     format_func=lambda m: {"normal": "normal — prévision T° = normale Enedis",
@@ -151,7 +158,7 @@ if not models_sel:
 
 tabs = st.tabs(["🏆 Choix du modèle", "🗄️ Jeux de données", "🗓️ Heatmap des erreurs",
                 "📊 Distribution des erreurs", "📈 Prévisions vs réel", "🔁 Walk-forward CV",
-                "⚙️ Hyperparamètres & importance", "🧠 Règles métier"])
+                "⚙️ Hyperparamètres & importance", "🧠 Règles métier", "🔧 Paramètres des modèles"])
 
 
 def unit(metric_name: str) -> str:
@@ -265,7 +272,7 @@ with tabs[1]:
     elif which.startswith("Features"):
         table = XF[feature_columns("normal") + ["load_mw", "special_period_type"]]
     else:
-        Xn = build_features(DF, CAL, clean_lags=True)
+        Xn = build_features(DF, CAL, clean_lags=True, issue_hour=ISSUE_HOUR)
         table = Xn[Xn["special_period_type"] == "NORMAL"][feature_columns("normal") + ["load_mw"]]
     if part != "Tout":
         a, b, _ = splits[part]
@@ -593,3 +600,165 @@ with tabs[7]:
     yr = pd.Timestamp(day).year
     st.markdown(f"**Classement des années analogues pour Noël {yr}** (score de similarité calendaire)")
     st.dataframe(rank_analogues(yr, range(2020, yr), "christmas"), width="stretch", hide_index=True)
+
+
+# =========================================================================== 9. paramètres des modèles
+with tabs[8]:
+    st.subheader("Paramètres des modèles entraînés")
+    MP, RP = R["model_params"], R["rule_params"]
+    meta = R["meta"]
+    TREE_LABEL = {"xgboost": "XGBoost (tous les jours)", "xgboost_normal": "XGBoost (jours normaux)",
+                  "random_forest": "Random Forest (tous les jours)",
+                  "random_forest_normal": "Random Forest (jours normaux)"}
+    if meta.get("models_saved"):
+        st.caption(f"Modèles sauvegardés dans `{meta.get('models_dir')}` (un dossier par scénario météo ; "
+                   "`F<fold>_<modèle>` = entraîné avant le fold, `final_<modèle>` = entraîné sur toutes "
+                   "les données). Détails de chargement : `manifest.json`.")
+    family = st.radio("Famille", ["Arbres (XGBoost, Random Forest)", "SARIMAX", "Règles métier",
+                                  "Baselines"], horizontal=True)
+
+    if family.startswith("Arbres"):
+        if MP.empty:
+            st.info("Pas de paramètres enregistrés : relancez `scripts/03_run_benchmark.py --save-models`.")
+        else:
+            tm = MP[(MP["weather_mode"] == mode) & MP["model"].isin(TREE_LABEL)]
+            name = st.selectbox("Modèle", list(TREE_LABEL), format_func=TREE_LABEL.get)
+            d = tm[tm["model"] == name].sort_values("fold_id")
+            fin = d[d["fold_id"] == 0]
+            base = name.replace("_normal", "")
+            best = meta["best_params"][base]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Variables d'entrée", int(d["n_features"].iloc[0]))
+            c2.metric("Lignes d'entraînement (modèle final)", f"{int(fin['n_train'].iloc[0]):,}" if len(fin) else "—")
+            c3.metric("Espace disque (tous folds + final)", f"{d['file_mb'].sum():,.0f} Mo")
+            st.markdown("##### Hyperparamètres")
+            allp = json.loads((fin if len(fin) else d).iloc[0]["params"])
+            rows = [{"paramètre": k, "valeur": str(v),
+                     "origine": "choisi par la grille (validation 2023)" if k in best else "fixé par la config"}
+                    for k, v in allp.items() if v is not None]
+            st.dataframe(pd.DataFrame(rows).sort_values(["origine", "paramètre"], ascending=[False, True]),
+                         width="stretch", hide_index=True, height=300)
+            ex = pd.DataFrame([{**json.loads(r.extra), "fold_id": r.fold_id} for r in d.itertuples()])
+            fdf = d[d["fold_id"] > 0]
+            left, right = st.columns(2)
+            fig = go.Figure(go.Bar(x=fdf["fold_id"], y=fdf["n_train"], marker_color=color(base),
+                                   hovertemplate="fold %{x}<br>%{y:,} lignes<extra></extra>"))
+            fig.update_xaxes(title="Fold (walk-forward)", dtick=1)
+            fig.update_yaxes(title="Lignes d'entraînement")
+            left.plotly_chart(style(fig, 300, "Taille de l'entraînement (fenêtre expanding)"), width="stretch")
+            if base == "random_forest":
+                e2 = ex[ex["fold_id"] > 0]
+                fig = go.Figure(go.Scatter(x=e2["fold_id"], y=e2["mean_nodes_per_tree"], mode="lines+markers",
+                                           line=dict(color=color(base), width=2.4),
+                                           hovertemplate="fold %{x}<br>%{y:,.0f} nœuds/arbre<extra></extra>"))
+                fig.update_yaxes(title="Nœuds moyens par arbre")
+                fig.update_xaxes(title="Fold", dtick=1)
+                right.plotly_chart(style(fig, 300, f"Complexité des arbres (profondeur max atteinte : "
+                                                   f"{int(ex['max_depth_reached'].max())})"), width="stretch")
+            else:
+                fig = go.Figure(go.Bar(x=fdf["fold_id"], y=fdf["file_mb"], marker_color=color(base),
+                                       hovertemplate="fold %{x}<br>%{y:.1f} Mo<extra></extra>"))
+                fig.update_xaxes(title="Fold", dtick=1)
+                fig.update_yaxes(title="Taille du fichier (Mo)")
+                right.plotly_chart(style(fig, 300, f"Taille du modèle ({int(ex['n_trees'].max())} arbres)"),
+                                   width="stretch")
+            st.markdown("##### Variables utilisées et leur importance (modèle « tous jours », données ≤ 2023)")
+            imp_ = R["feature_importance"]
+            piv = imp_.pivot_table(index="feature", columns="model", values="importance").fillna(0)
+            piv = piv.reindex(feature_columns(mode)).fillna(0)
+            piv.columns = [LABEL[c] for c in piv.columns]
+            st.dataframe((piv * 100).round(2).sort_values(piv.columns[0], ascending=False)
+                         .rename_axis("variable"), width="stretch", height=320)
+            st.caption("Importance en % (gain moyen). Les colonnes de charge sont retardées d'au moins 24 h ; "
+                       "voir la convention d'émission dans la barre latérale.")
+            with st.expander("Recharger ces modèles en Python"):
+                st.code(f"""from xgboost import XGBRegressor
+import joblib
+xgb = XGBRegressor(); xgb.load_model("{meta.get('models_dir', 'data/models')}/{mode}/final_xgboost.ubj")
+rf = joblib.load("{meta.get('models_dir', 'data/models')}/{mode}/final_random_forest.joblib")
+# colonnes attendues (dans cet ordre) : rte_forecast.features.feature_columns("{mode}")""", language="python")
+
+    elif family == "SARIMAX":
+        sx = MP[(MP["model"] == "sarimax") & (MP["weather_mode"] == mode)].sort_values("fold_id") \
+            if not MP.empty else pd.DataFrame()
+        sp_ = R["meta"].get("best_params", {})
+        p0 = json.loads(sx.iloc[0]["params"]) if len(sx) else None
+        st.markdown("SARIMAX est **ré-estimé au début de chaque fold** sur une fenêtre glissante, puis son filtre "
+                    "est prolongé jour après jour sans ré-estimation : il n'existe donc pas un mais 12 jeux de "
+                    "coefficients.")
+        if p0:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ordre (p,d,q)", str(tuple(p0["order"])))
+            c2.metric("Ordre saisonnier", str(tuple(p0["seasonal_order"])))
+            c3.metric("Fenêtre d'estimation", f"{p0['train_window_days']} jours")
+            c4.metric("Itérations max", p0["maxiter"])
+            coef = pd.DataFrame({int(r.fold_id): json.loads(r.extra)["coefficients"] for r in sx.itertuples()}).T
+            coef.index.name = "fold"
+            NAMES = {"temperature_forecast": "β température (MW/°C)",
+                     "temperature_forecast_squared": "β température² (÷100)",
+                     "is_saturday": "β samedi", "is_sunday": "β dimanche", "is_monday": "β lundi",
+                     "is_friday": "β vendredi", "is_public_holiday": "β férié", "is_bridge_day": "β pont",
+                     "ar.L1": "AR(1)", "ma.L1": "MA(1)", "ar.S.L24": "AR saisonnier (24 h)",
+                     "ma.S.L24": "MA saisonnier (24 h)", "sigma2": "variance résiduelle σ²"}
+            st.markdown("##### Coefficients estimés par fold")
+            st.dataframe(coef.rename(columns=NAMES).round(3), width="stretch")
+            sel = st.multiselect("Coefficients à tracer", list(coef.columns), default=[
+                c for c in ["temperature_forecast", "is_public_holiday", "is_sunday"] if c in coef.columns],
+                format_func=lambda c: NAMES.get(c, c))
+            fig = go.Figure()
+            for i, c in enumerate(sel):
+                fig.add_trace(go.Scatter(x=coef.index, y=coef[c], mode="lines+markers", name=NAMES.get(c, c),
+                                         line=dict(width=2.2, color=(CAT_DARK if DARK else CAT_LIGHT)[i % 8])))
+            fig.update_xaxes(title="Fold", dtick=1)
+            st.plotly_chart(style(fig, 340, "Évolution des coefficients au fil des folds"), width="stretch")
+            st.caption("Les coefficients exogènes sont en MW. Les indicatrices sont relatives au reste de la "
+                       "semaine (mardi-jeudi). Un coefficient de température qui change de signe d'un fold à "
+                       "l'autre signale une estimation instable sur 84 jours.")
+        else:
+            st.info("Pas de paramètres enregistrés : relancez `scripts/03_run_benchmark.py --save-models`.")
+
+    elif family == "Règles métier":
+        st.markdown("Les règles ne sont pas des modèles entraînés : ce sont des **paramètres estimés sur "
+                    "l'historique connu avant la période prévue** (année analogue, niveaux, formes).")
+        cfg_rows = [{"paramètre": k, "valeur": str(v)} for k, v in CFG["rules"].items()]
+        st.markdown("##### Configuration")
+        st.dataframe(pd.DataFrame(cfg_rows), width="stretch", hide_index=True)
+        if not RP.empty:
+            hyb = st.selectbox("Variante", ["random_forest_rules", "random_forest_rules_adaptive"],
+                               format_func=LABEL.get)
+            rp = RP[(RP["weather_mode"] == mode) & (RP["model"] == hyb)].sort_values(["kind", "year"])
+            st.markdown("##### Paramètres estimés par période et par année cible")
+            t = rp[["kind", "year", "reference_year", "similarity_score", "thermosensitivity_heat_mw_per_c",
+                    "baseline_mw", "baseline_ref_mw", "summer_start_level_mw", "summer_trough_level_mw",
+                    "summer_end_level_mw"]].rename(columns={
+                "kind": "période", "year": "année cible", "reference_year": "année(s) de référence",
+                "similarity_score": "score d'analogie", "thermosensitivity_heat_mw_per_c": "sensibilité T° (MW/°C)",
+                "baseline_mw": "niveau de départ (MW)", "baseline_ref_mw": "niveau de réf. (MW)",
+                "summer_start_level_mw": "été : départ (MW)", "summer_trough_level_mw": "été : creux (MW)",
+                "summer_end_level_mw": "été : fin (MW)"})
+            st.dataframe(t.round(2), width="stretch", hide_index=True)
+            st.caption("Sensibilité thermique : estimée causalement sur l'historique précédant la période "
+                       "(elle sert à ramener les références à la température normale).")
+            su = rp[rp["kind"] == "SUMMER"]
+            if len(su):
+                yr = st.selectbox("Forme de la rampe estivale — année cible", list(su["year"]))
+                shp = json.loads(su[su["year"] == yr].iloc[0]["shape_json"])
+                fig = go.Figure(go.Bar(x=[int(k) for k in shp], y=list(shp.values()),
+                                       marker_color=color("random_forest_rules"),
+                                       hovertemplate="semaine %{x}<br>%{y:.3f}<extra></extra>"))
+                fig.update_xaxes(title="Semaine relative au creux (0 = semaine du 15 août)", dtick=1)
+                fig.update_yaxes(title="Niveau / niveau avant vacances", range=[0.85, 1.05])
+                st.plotly_chart(style(fig, 320, f"Forme médiane apprise pour {yr}"), width="stretch")
+        ah = R["analysis_holidays"]
+        if len(ah):
+            st.markdown("##### Coefficients des jours fériés (charge du jour / même jour de semaine ordinaire)")
+            hol = ah[ah["kind"] == "holiday"].groupby(["name", "weekday_class"]).agg(
+                occurrences=("ratio", "size"), coefficient_médian=("ratio", "median"),
+                min=("ratio", "min"), max=("ratio", "max")).reset_index()
+            st.dataframe(hol.round(3).sort_values("coefficient_médian"), width="stretch", hide_index=True)
+            st.caption("Le coefficient appliqué à une prévision est la médiane des occurrences historiques "
+                       "comparables (même férié et même classe de jour, à défaut même classe, puis même férié).")
+
+    else:
+        st.markdown("""* **Naive J-7** : aucun paramètre — la charge de la même heure, une semaine plus tôt (retard de 168 h).
+* **RTE J-1** : prévision externe publiée par RTE, non entraînée ici ; sert de référence.""")

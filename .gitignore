@@ -9,3 +9,4 @@ data/processed/*
 data/results/*
 !data/**/.gitkeep
 data/results_*/
+data/models/

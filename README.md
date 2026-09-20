@@ -23,12 +23,9 @@ Pas d'Airflow / Docker / MLflow / PyTorch à ce stade, volontairement.
 uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev,dashboard]"   # ou pip
 python scripts/01_prepare_data.py          # eCO2mix + Enedis (+ proxy Open-Meteo) -> Parquet
 python scripts/02_analyze_hypotheses.py    # vérification empirique des hypothèses métier
-python scripts/03_run_benchmark.py         # hyperparamètres, walk-forward, SHAP (~20 min)
+python scripts/03_run_benchmark.py --save-models   # hyperparamètres, walk-forward, SHAP, sauvegarde des modèles
 streamlit run app/dashboard.py             # comparer les modèles, heatmaps d'erreurs, etc.
-python scripts/03_run_benchmark.py --issue-hour 9 --results-dir data/results_issue10h  # émission à D-1 10:00
-# TFT (GPU) : notebooks/colab_tft.ipynb -> scripts/05_train_tft.py, puis en local :
-python scripts/04_bootstrap_compare.py --results-dir data/results_issue10h --a random_forest_rules_adaptive --b random_forest  # IC bootstrap
-python scripts/06_merge_tft.py --tft-dir <dossier_téléchargé> --results-dir data/results_issue10h
+python scripts/04_bootstrap_compare.py --a random_forest_rules_adaptive --b random_forest   # IC bootstrap
 pytest && ruff check .
 ```
 
@@ -42,22 +39,24 @@ src/rte_forecast/
   calendar/        holidays, bridge_days, special_periods
   features/        build_features (SANS fuite)
   models/          baseline (J-7, RTE J-1), sarimax, xgboost_model, random_forest
-                   tft (Temporal Fusion Transformer compact, torch : extra `.[tft]`, non importé par défaut)
   business_rules/  analogue, period_transfer, year_end, year_start, summer, isolated_holidays, weather
   evaluation/      splits, metrics, backtest, analysis
   forecast.py      routeur RF/XGB  <->  règles métier + explicabilité
 app/dashboard.py   dashboard Streamlit
-scripts/           01_prepare_data, 02_analyze_hypotheses, 03_run_benchmark, 04_bootstrap_compare, 05_train_tft, 06_merge_tft
+scripts/           01_prepare_data, 02_analyze_hypotheses, 03_run_benchmark, 04_bootstrap_compare
 tests/             anti-fuite, qualité des données, calendrier, règles métier, métriques
 ```
 
 ## Convention temporelle (anti-fuite)
 
-La prévision du jour D est émise à **D 00:00** : la dernière charge connue est celle de D-1 23:00.
-Toute feature dérivée de la charge a donc un **retard ≥ 24 h** (`build_features` refuse moins). Les
-moteurs de règles ne lisent que des données antérieures au début de la période prévue (mode
-`planning`) ou au jour prévu (mode `adaptive`). Les splits sont strictement chronologiques,
-jamais de shuffle. Voir `tests/test_features_leakage.py` et `tests/test_business_rules.py`.
+La prévision du jour D est émise à **D-1 10:00** (`features.issue_hour: 9`) : la dernière charge connue
+est celle de D-1 09:00, comme pour une vraie prévision J-1. Pour l'heure cible h, un retard de charge L
+n'est donc légal que si L ≥ 24 + h − 9 : le « lag 24 h » devient un lag de 48 h pour les heures > 9 et
+les moyennes glissantes sont ancrées à D-1 09:00 (`build_features` refuse toute feature plus récente).
+SARIMAX est prolongé jusqu'à D-1 09:00 seulement, et les moteurs de règles ne lisent que des données
+antérieures au début de la période prévue (mode `planning`) ou à J-2 (mode `adaptive`, J-1 étant
+incomplet). Les splits sont strictement chronologiques, jamais de shuffle. Voir
+`tests/test_features_leakage.py`, `tests/test_business_rules.py` et `tests/test_sarimax_issue.py`.
 
 ## Scénarios météo (à lire avant d'interpréter un résultat)
 

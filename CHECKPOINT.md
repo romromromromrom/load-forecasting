@@ -1,6 +1,6 @@
 # CHECKPOINT — rte-load-forecasting-demo
 
-> Journal de bord pour reprendre le travail. Dernière mise à jour : 2026-09-19 (benchmark complet exécuté).
+> Journal de bord pour reprendre le travail. Dernière mise à jour : 2026-09-20 (benchmark complet relancé en convention D-1 10:00, modèles sauvegardés).
 > Les résultats chiffrés et leur interprétation sont dans **`RESULTS.md`** ; ici : ce qui a été fait,
 > comment, ce qui a coincé, et ce que vous devez remplacer/valider.
 
@@ -26,11 +26,11 @@ Aucune donnée de **charge** n'est synthétique : eCO2mix 2020-2024 est complet 
 6. **Moteurs de règles** — fin d'année, début d'année, été, fériés/ponts isolés, routeur `forecast.py`, explicabilité (`format_explanation`).
 7. **Backtest walk-forward** — 12 folds trimestriels (2022-T1 → 2024-T4), split train ≤ 2022 / validation 2023 / test 2024, grille d'hyperparamètres sur la validation, SHAP.
 8. **Dashboard Streamlit** (`app/dashboard.py`) — choix du modèle, jeux de données, heatmaps annuelles (x = jour, y = mois), distributions d'erreurs, prévisions vs réel, CV, hyperparamètres, importance/SHAP, règles métier + explications.
-9. **Tests (68) + CI GitHub Actions (ruff → pytest)** ; test de mutation manuel : une fuite injectée est bien détectée.
+9. **Tests (102) + CI GitHub Actions (ruff → pytest)** ; test de mutation manuel : une fuite injectée est bien détectée.
 
 ## 2. Décisions de conception à connaître
 
-* **Instant d'émission** : le forecast du jour D est émis à **D 00:00** (charge connue jusqu'à D-1 23:00). C'est optimiste vs. la réalité (RTE publie sa J-1 plus tôt dans la journée D-1) ; c'est ce qui rend « lag 24 h » légal pour toutes les heures de D. **Durcissement fait (2026-09-20)** : `features.issue_hour: 9` = émission à D-1 10:00 (lag 48 h pour h > 9, moyennes ancrées à D-1 09:00, SARIMAX et règles adaptatives décalés), résultats dans `data/results_issue10h/`, chiffrés dans `RESULTS.md § 3 bis`. Le défaut reste D 00:00 (`issue_hour: null`) pour la reproductibilité des §§ 1-4.
+* **Instant d'émission (convention unique)** : le forecast du jour D est émis à **D-1 10:00** (charge connue jusqu'à D-1 09:00, `features.issue_hour: 9`), comme une vraie J-1. Lag 48 h pour les heures cibles > 9, moyennes glissantes ancrées à D-1 09:00, SARIMAX et règles adaptatives décalés (D-8..D-2). Une première version émettait à D 00:00 (optimiste, ≈ −24 % de précision) : abandonnée. L'heure de 10:00 reste une hypothèse à confronter au calendrier de publication RTE.
 * **Deux versions de features** : « brutes » (modèles tous jours) et « propres » (lags dont la *source* est un jour atypique neutralisés → NaN, repli hebdomadaire jusqu'à 6 semaines) pour le modèle « jour normal ». Les NaN sont gérés nativement (XGBoost, sklearn ≥ 1.4).
 * **Température** : trois scénarios (`normal` opérationnel, `noisy` synthétique, `perfect` oracle). La température **réalisée n'est jamais une feature** en `normal`/`noisy` (test dédié). Le mode `perfect` est un plafond théorique, pas un résultat.
 * **« RF seul »/« XGBoost seul »** = entraînés sur *tous* les jours avec les drapeaux calendaires (comparaison équitable) ; **hybride** = entraîné sur jours NORMAUX uniquement + règles pour le reste.
@@ -61,24 +61,26 @@ Aucune donnée de **charge** n'est synthétique : eCO2mix 2020-2024 est complet 
 4. **Erreurs énormes au premier essai des règles** (6–15 GW, biais systématique) : ce n'était pas un bug mais l'anomalie météo de l'année analogue → normalisation météo.
 5. **Année analogue médiocre** : avec 5 ans d'historique, le meilleur analogue a souvent un score de 0,25–0,5 (jour de semaine de Noël différent) ; 2021-2023 sont marquées par la crise énergétique (sobriété) et le COVID.
 6. **pandas 3** (dtype `str` strict) : colonnes texte `object`, entiers/`None` mélangés illisibles en Parquet, `None` YAML lu comme chaîne (→ `null`).
-7. **Mémoire limitée (7 Go)** : parallélisme joblib limité à 4 processus, RF à 2 threads max.
+7. **Mémoire limitée (7 Go)** : le dernier run a été fait sur 1 seul processus (`--jobs 1`, `nice 19`, 1 thread BLAS) pour ne pas encombrer la machine (72 min) ; les modèles sont sauvegardés dans le processus qui les entraîne. Résultats identiques (0,0 MW) à ceux d'un run à 4 processus.
 8. **Meilleurs hyperparamètres en bordure de grille** (XGBoost : profondeur 9 = max, 500 arbres = max ; RF : `min_samples_leaf=2` = min) → la grille devrait être étendue.
 9. **Playwright MCP indisponible** : le dashboard n'a pas pu être validé visuellement dans un navigateur ; il est vérifié via `streamlit.testing.AppTest` (aucune exception) — **à regarder à l'œil**.
 
 ## 5. Résultat en une phrase
 
-Sur le test 2024 (météo opérationnelle = normale), **RF/XGBoost « tous jours » (MAE ≈ 1,35–1,38 GW) battent SARIMAX (2,02 GW) et J-7 (3,23 GW)** et **le hybride ML + règles n'est pas meilleur que le ML seul** (1,67–1,71 GW) ; seuls les fériés isolés bénéficient des règles. Détails, IC et limites : `RESULTS.md`.
+Sur le test 2024 (émission D-1 10:00, météo opérationnelle = normale), **RF/XGBoost « tous jours » (MAE 1,70 GW) battent SARIMAX (2,91 GW) et J-7 (3,23 GW)** mais restent derrière **RTE J-1 (1,43 GW)**, et **le hybride ML + règles n'est pas meilleur que le ML seul** (1,94–1,98 GW) : leur forme horaire est meilleure mais leur niveau est biaisé par l'anomalie de température (§ 3 bis de `RESULTS.md`) ; seuls les fériés isolés bénéficient des règles (et toutes les règles bénéficient d'une météo connue). Détails, IC et limites : `RESULTS.md`.
 
 ## 6. Prochaines étapes
 
-Voir `RESULTS.md § 6`. Priorités : (1) vraies prévisions météo archivées, (2) instant d'émission plus réaliste, (3) historique eCO2mix 2012-2019, (4) go/no-go sur les règles (garder les fériés isolés).
+Voir `RESULTS.md § 6`. Priorités : (1) vraies prévisions météo archivées (ou au moins une persistance de l'anomalie de température) pour le ML et les règles, (2) confronter l'heure d'émission (10:00) au calendrier réel de publication RTE, (3) historique eCO2mix 2012-2019, (4) go/no-go sur les règles (garder les fériés isolés).
 
 ## 7. Reproduire
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python -e ".[dev,dashboard]"
-.venv/bin/python scripts/01_prepare_data.py && .venv/bin/python scripts/02_analyze_hypotheses.py
-.venv/bin/python scripts/03_run_benchmark.py --jobs 4     # ~35 min sur 8 cœurs (3 scénarios météo)
+.venv/bin/python scripts/01_prepare_data.py    # ⚠ retélécharge Enedis (fenêtre glissante de 5 ans) : NE PAS relancer si on veut retrouver les résultats publiés
+.venv/bin/python scripts/02_analyze_hypotheses.py
+OMP_NUM_THREADS=1 nice -n 19 .venv/bin/python scripts/03_run_benchmark.py --jobs 1 --save-models   # ~72 min sur 1 cœur ; --jobs 4 : ~35 min
+.venv/bin/python scripts/04_bootstrap_compare.py --a random_forest_rules_adaptive --b random_forest
 .venv/bin/streamlit run app/dashboard.py
 .venv/bin/pytest && .venv/bin/ruff check .
 ```

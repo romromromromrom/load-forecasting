@@ -24,7 +24,6 @@ dependencies = [
 [project.optional-dependencies]
 dashboard = ["streamlit>=1.35", "plotly>=5.20", "shap>=0.45"]
 dev = ["pytest>=8", "ruff>=0.5"]
-tft = ["torch>=2.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

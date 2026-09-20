@@ -3,6 +3,7 @@ paths:
   raw_dir: data/raw
   processed_dir: data/processed
   results_dir: data/results
+  models_dir: data/models                  # modèles entraînés (03_run_benchmark.py --save-models)
   eco2mix_zip_dir: .                       # les zips eCO2mix sont à la racine du projet
   eco2mix_zip_glob: "eCO2mix_RTE_Annuel-Definitif_*.zip"
 
@@ -29,10 +30,10 @@ cv:
 features:
   min_lag_hours: 24
   max_fallback_weeks: 6
-  # Instant d'émission. null = D 00:00 (historique, optimiste). k = dernière heure de D-1 connue :
-  # 9 -> prévision émise à D-1 10:00 (comme une vraie J-1) ; lags 24/48 h et moyennes glissantes
-  # ancrées en conséquence, SARIMAX et règles adaptatives décalés. Voir RESULTS.md § 3 bis.
-  issue_hour: null
+  # Instant d'émission = dernière heure de D-1 dont la charge est connue. 9 -> prévision émise à
+  # D-1 10:00 (comme une vraie J-1) : lag 48 h pour les heures cibles > 9, moyennes glissantes
+  # ancrées à D-1 09:00, SARIMAX et règles adaptatives décalés. (null = D 00:00, optimiste.)
+  issue_hour: 9
 
 weather:
   # "normal"  : température prévue = normale Enedis (mode opérationnel, sans oracle)

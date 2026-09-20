@@ -48,6 +48,9 @@ class SarimaxDayAhead:
         self.known = 23 if issue_hour is None else int(issue_hour)
         self.train_window_days, self.maxiter = train_window_days, maxiter
         self.fit_seconds = 0.0
+        self.fitted_params: dict[str, float] = {}
+        self.train_window: tuple[str, str] = ("", "")   # fenêtre d'estimation des coefficients
+        self.exog_names: list[str] = []
 
     def fit_predict(self, load: pd.Series, exog: pd.DataFrame, start: pd.Timestamp,
                     end: pd.Timestamp) -> pd.Series:
@@ -66,6 +69,9 @@ class SarimaxDayAhead:
                             enforce_stationarity=False, enforce_invertibility=False)
             res = model.fit(disp=False, maxiter=self.maxiter)
         self.fit_seconds = time.perf_counter() - t0
+        self.fitted_params = {k: float(v) for k, v in res.params.items()}
+        self.train_window = (str(y_tr.index[0]), str(y_tr.index[-1]))
+        self.exog_names = list(x_tr.columns)
         preds = []
         for day in pd.date_range(start.normalize(), end.normalize(), freq="D"):
             idx = pd.date_range(day, periods=24, freq="h")
